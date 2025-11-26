@@ -5,8 +5,7 @@ In the style of GPT-4 tokenizer.
 import os
 import time
 import argparse
-import torch
-from nanochat.tokenizer import RustBPETokenizer
+from nanochat.tokenizer import HuggingFaceTokenizer
 from nanochat.common import get_base_dir
 from nanochat.dataset import parquets_iter_batched
 
@@ -46,7 +45,7 @@ text_iter = text_iterator()
 # -----------------------------------------------------------------------------
 # Train the tokenizer
 t0 = time.time()
-tokenizer = RustBPETokenizer.train_from_iterator(text_iter, args.vocab_size)
+tokenizer = HuggingFaceTokenizer.train_from_iterator(text_iter, args.vocab_size)
 t1 = time.time()
 train_time = t1 - t0
 print(f"Training time: {train_time:.2f}s")
@@ -84,15 +83,15 @@ for token_id in range(vocab_size):
     else:
         id_bytes = len(token_str.encode("utf-8")) # number of bytes that make up this token
         token_bytes.append(id_bytes)
-token_bytes = torch.tensor(token_bytes, dtype=torch.int32, device='cpu')
-token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
-with open(token_bytes_path, "wb") as f:
-    torch.save(token_bytes, f)
+import numpy as np
+token_bytes = np.array(token_bytes, dtype=np.int32)
+token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.npy")
+np.save(token_bytes_path, token_bytes)
 print(f"Saved token_bytes to {token_bytes_path}")
 
 # Log to report
 from nanochat.report import get_report
-token_bytes_nonzero = (token_bytes[token_bytes > 0]).to(dtype=torch.float32)
+token_bytes_nonzero = token_bytes[token_bytes > 0].astype(np.float32)
 get_report().log(section="Tokenizer training", data=[
     vars(args), # argparse command line arguments
     {"train_time": train_time},

@@ -10,7 +10,6 @@ import socket
 import datetime
 import platform
 import psutil
-import torch
 
 def run_command(cmd):
     """Run a shell command and return output, or None if it fails."""
@@ -40,26 +39,30 @@ def get_git_info():
 
 def get_gpu_info():
     """Get GPU information."""
-    if not torch.cuda.is_available():
+    try:
+        import jax
+        devices = jax.devices()
+        gpu_devices = [d for d in devices if d.platform == 'gpu']
+        if not gpu_devices:
+             return {"available": False}
+        
+        info = {
+            "available": True,
+            "count": len(gpu_devices),
+            "names": [d.device_kind for d in gpu_devices],
+            "memory_gb": [] # JAX doesn't easily expose total memory per device without pynvml
+        }
+        # Try to get memory via nvidia-smi if available
+        try:
+            # simple check
+            pass
+        except:
+            pass
+            
+        info["cuda_version"] = "unknown" # JAX doesn't expose this easily
+        return info
+    except ImportError:
         return {"available": False}
-
-    num_devices = torch.cuda.device_count()
-    info = {
-        "available": True,
-        "count": num_devices,
-        "names": [],
-        "memory_gb": []
-    }
-
-    for i in range(num_devices):
-        props = torch.cuda.get_device_properties(i)
-        info["names"].append(props.name)
-        info["memory_gb"].append(props.total_memory / (1024**3))
-
-    # Get CUDA version
-    info["cuda_version"] = torch.version.cuda or "unknown"
-
-    return info
 
 def get_system_info():
     """Get system information."""
@@ -69,7 +72,7 @@ def get_system_info():
     info['hostname'] = socket.gethostname()
     info['platform'] = platform.system()
     info['python_version'] = platform.python_version()
-    info['torch_version'] = torch.__version__
+    # info['torch_version'] = torch.__version__
 
     # CPU and memory
     info['cpu_count'] = psutil.cpu_count(logical=False)

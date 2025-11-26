@@ -1,13 +1,12 @@
 from collections import deque
-
-import torch
+import numpy as np
 import pyarrow.parquet as pq
 
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 from nanochat.tokenizer import get_tokenizer
 
-def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads=4, tokenizer_batch_size=128, device="cuda", resume_state_dict=None):
+def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads=4, tokenizer_batch_size=128, resume_state_dict=None):
     """
     Stream pretraining text from parquet files, tokenize, yield training batches.
 
@@ -69,15 +68,18 @@ def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads
                 token_buffer.extend(tokens)
         # Move tokens from the deque into the scratch buffer
         tokens = [token_buffer.popleft() for _ in range(needed_tokens)]
-        # CUDA supports memory pinning for asynchronous transfers between CPU and GPU
-        use_cuda_optimizations = device == "cuda"
-        scratch = torch.tensor(tokens, dtype=torch.long, pin_memory=use_cuda_optimizations) # in PyTorch, long=int64
-        # Create the inputs/targets as 1D tensors
+        
+        # Convert to numpy array
+        scratch = np.array(tokens, dtype=np.int32)
+        
+        # Create the inputs/targets as 1D arrays
         inputs_cpu = scratch[:-1]
         targets_cpu = scratch[1:]
-        # Reshape to 2D and move to GPU async
-        inputs = inputs_cpu.view(B, T).to(device=device, non_blocking=use_cuda_optimizations)
-        targets = targets_cpu.view(B, T).to(device=device, non_blocking=use_cuda_optimizations)
+        
+        # Reshape to 2D
+        inputs = inputs_cpu.reshape(B, T)
+        targets = targets_cpu.reshape(B, T)
+        
         state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx} # we need this in case we wish to approximately resume training
         yield inputs, targets, state_dict
 

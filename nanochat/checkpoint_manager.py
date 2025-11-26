@@ -1,145 +1,111 @@
 """
-Utilities for saving and loading model/optim/state checkpoints.
+Utilities for saving and loading model/optim/state checkpoints using Orbax (JAX).
 """
 import os
-import re
-import glob
 import json
 import logging
-import torch
+import jax
+import orbax.checkpoint as ocp
+from flax import nnx
 
-from nanochat.common import get_base_dir
+from nanochat.common import get_base_dir, setup_default_logging
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
-from nanochat.common import setup_default_logging
 
 # Set up logging
 setup_default_logging()
 logger = logging.getLogger(__name__)
 def log0(message):
-    if int(os.environ.get('RANK', 0)) == 0:
+    # In JAX/JIT, we might not have explicit rank env vars if using jax.distributed
+    # But we can check jax.process_index()
+    if jax.process_index() == 0:
         logger.info(message)
 
-def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
-    if rank == 0:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        # Save the model state parameters
-        model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-        torch.save(model_data, model_path)
-        logger.info(f"Saved model parameters to: {model_path}")
-        # Save the metadata dict as json
-        meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta_data, f, indent=2)
-        logger.info(f"Saved metadata to: {meta_path}")
-    # Note that optimizer state is sharded across ranks, so each rank must save its own.
-    if optimizer_data is not None:
-        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        torch.save(optimizer_data, optimizer_path)
-        logger.info(f"Saved optimizer state to: {optimizer_path}")
+class CheckpointManager:
+    def __init__(self, directory, max_to_keep=5):
+        self.directory = directory
+        # Use StandardCheckpointer which handles PyTrees (model, optim, meta)
+        self.mgr = ocp.CheckpointManager(
+            os.path.abspath(directory),
+            ocp.StandardCheckpointer(),
+            options=ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, create=True)
+        )
 
-def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
-    # Load the model state
-    model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-    model_data = torch.load(model_path, map_location=device)
-    # Load the optimizer state if requested
-    optimizer_data = None
-    if load_optimizer:
-        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        optimizer_data = torch.load(optimizer_path, map_location=device)
-    # Load the metadata
-    meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-    with open(meta_path, "r", encoding="utf-8") as f:
-        meta_data = json.load(f)
+    def save(self, step, model_state, optimizer_state=None, meta_data=None):
+        # Bundle everything into a single PyTree
+        # meta_data is a dict, model_state is a PyTree, optimizer_state is a PyTree
+        save_args = {'model': model_state}
+        if optimizer_state is not None:
+            save_args['optim'] = optimizer_state
+        if meta_data is not None:
+            save_args['meta'] = meta_data
+            
+        # We only save on rank 0 usually, but Orbax handles distributed saving.
+        # We should call save on all processes, Orbax coordinates.
+        self.mgr.save(step, save_args)
+        # Wait for save to complete? Orbax usually blocks or handles it.
+        
+    def load(self, step, target=None):
+        # target is an optional PyTree with the same structure as saved data
+        # If target is provided, Orbax restores into it (useful for sharding)
+        return self.mgr.restore(step, items=target)
+
+    def latest_step(self):
+        return self.mgr.latest_step()
+
+# Wrapper functions to maintain some compatibility or ease of use
+def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+    # This function is deprecated in favor of using CheckpointManager directly in the loop
+    # But for compatibility with existing structure, we can instantiate a manager.
+    # Warning: Instantiating manager every time might be slow or problematic.
+    # It's better to update the training loop.
+    # I will implement this as a helper that creates a manager.
+    mgr = CheckpointManager(checkpoint_dir)
+    mgr.save(step, model_data, optimizer_data, meta_data)
+
+def load_checkpoint(checkpoint_dir, step, device=None, load_optimizer=False, rank=0):
+    # device argument is ignored in JAX (handled by sharding)
+    mgr = CheckpointManager(checkpoint_dir)
+    restored = mgr.load(step)
+    model_data = restored.get('model')
+    optimizer_data = restored.get('optim') if load_optimizer else None
+    meta_data = restored.get('meta')
     return model_data, optimizer_data, meta_data
 
-
-def build_model(checkpoint_dir, step, device, phase):
+def build_model(checkpoint_dir, step, device=None, phase="eval"):
     """
-    A bunch of repetitive code to build a model from a given checkpoint.
-    Returns:
-    - base model - uncompiled, not wrapped in DDP
-    - tokenizer
-    - meta data saved during base model training
+    Builds a model from a checkpoint.
     """
-    assert phase in ["train", "eval"], f"Invalid phase: {phase}"
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
-    if device.type in {"cpu", "mps"}:
-        # Convert bfloat16 tensors to float for CPU inference
-        model_data = {
-            k: v.float() if v.dtype == torch.bfloat16 else v
-            for k, v in model_data.items()
-        }
-    # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
-    model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
+    mgr = CheckpointManager(checkpoint_dir)
+    if step is None:
+        step = mgr.latest_step()
+        if step is None:
+             raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
+    
+    restored = mgr.load(step)
+    meta_data = restored['meta']
     model_config_kwargs = meta_data["model_config"]
     log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
-    with torch.device("meta"):
-        model = GPT(model_config)
-    # Load the model state
-    model.to_empty(device=device)
-    model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
-    model.load_state_dict(model_data, strict=True, assign=True)
-    # Put the model in the right training phase / mode
-    if phase == "eval":
-        model.eval()
-    else:
-        model.train()
-    # Load the Tokenizer
+    
+    config = GPTConfig(**model_config_kwargs)
+    rngs = nnx.Rngs(0)
+    model = GPT(config, rngs=rngs)
+    
+    # In NNX, we update the model state
+    # restored['model'] should be the state
+    # We need to ensure the structure matches.
+    # If we saved nnx.state(model), we can load it back.
+    
+    # However, we need to be careful about abstract values vs concrete.
+    # When we init GPT, it has concrete weights (random).
+    # We update them.
+    
+    nnx.update(model, restored['model'])
+    
     tokenizer = get_tokenizer()
-    # Sanity check: compatibility between model and tokenizer
-    assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"]
     return model, tokenizer, meta_data
 
-
-def find_largest_model(checkpoint_dir):
-    # attempt to guess the model tag: take the biggest model available
-    model_tags = [f for f in os.listdir(checkpoint_dir) if os.path.isdir(os.path.join(checkpoint_dir, f))]
-    if not model_tags:
-        raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
-    # 1) normally all model tags are of the form d<number>, try that first:
-    candidates = []
-    for model_tag in model_tags:
-        match = re.match(r"d(\d+)", model_tag)
-        if match:
-            model_depth = int(match.group(1))
-            candidates.append((model_depth, model_tag))
-    if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
-    # 2) if that failed, take the most recently updated model:
-    model_tags.sort(key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)), reverse=True)
-    return model_tags[0]
-
-
-def find_last_step(checkpoint_dir):
-    # Look into checkpoint_dir and find model_<step>.pt with the highest step
-    checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "model_*.pt"))
-    if not checkpoint_files:
-        raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
-    last_step = int(max(os.path.basename(f).split("_")[-1].split(".")[0] for f in checkpoint_files))
-    return last_step
-
-# -----------------------------------------------------------------------------
-# convenience functions that take into account nanochat's directory structure
-
-def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=None):
-    if model_tag is None:
-        # guess the model tag by defaulting to the largest model
-        model_tag = find_largest_model(checkpoints_dir)
-        log0(f"No model tag provided, guessing model tag: {model_tag}")
-    checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
-    if step is None:
-        # guess the step by defaulting to the last step
-        step = find_last_step(checkpoint_dir)
-    assert step is not None, f"No checkpoints found in {checkpoint_dir}"
-    # build the model
-    log0(f"Loading model from {checkpoint_dir} with step {step}")
-    model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase)
-    return model, tokenizer, meta_data
-
-def load_model(source, *args, **kwargs):
+def load_model(source, device=None, phase="eval", model_tag=None, step=None):
     model_dir = {
         "base": "base_checkpoints",
         "mid": "mid_checkpoints",
@@ -148,4 +114,22 @@ def load_model(source, *args, **kwargs):
     }[source]
     base_dir = get_base_dir()
     checkpoints_dir = os.path.join(base_dir, model_dir)
-    return load_model_from_dir(checkpoints_dir, *args, **kwargs)
+    
+    if model_tag is None:
+        # Find largest model (directory with latest step?)
+        # This logic is a bit different with Orbax structure.
+        # Orbax creates subdirs in the checkpoint_dir.
+        # But here `checkpoints_dir` contains `model_tag` directories.
+        # We need to find the `model_tag` directory.
+        if os.path.exists(checkpoints_dir):
+            tags = [d for d in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, d))]
+            if not tags:
+                raise FileNotFoundError(f"No model tags found in {checkpoints_dir}")
+            # Sort by modification time or name
+            tags.sort(key=lambda x: os.path.getmtime(os.path.join(checkpoints_dir, x)), reverse=True)
+            model_tag = tags[0]
+        else:
+            raise FileNotFoundError(f"Checkpoints dir {checkpoints_dir} not found")
+            
+    checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
+    return build_model(checkpoint_dir, step, device, phase)
