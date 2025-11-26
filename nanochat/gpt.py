@@ -169,6 +169,9 @@ class GPT(nnx.Module):
         for i, block in enumerate(self.h):
             x = block(x, cos_sin, kv_cache=kv_cache, layer_idx=i)
             
+        if kv_cache is not None:
+            kv_cache.increment_pos(T)
+            
         x = nnx.RMSNorm(x.shape[-1], use_scale=False)(x)
         
         logits = self.lm_head(x)
@@ -184,43 +187,50 @@ class GPT(nnx.Module):
         else:
             return logits
 
-class KVCache:
+class KVCache(nnx.Module):
     def __init__(self, batch_size, num_layers, n_kv_head, head_dim, max_len):
-        self.k = jnp.zeros((num_layers, batch_size, n_kv_head, max_len, head_dim))
-        self.v = jnp.zeros((num_layers, batch_size, n_kv_head, max_len, head_dim))
-        self.pos = 0
+        self.k = nnx.Variable(jnp.zeros((num_layers, batch_size, n_kv_head, max_len, head_dim)))
+        self.v = nnx.Variable(jnp.zeros((num_layers, batch_size, n_kv_head, max_len, head_dim)))
+        self.pos = nnx.Variable(0)
         
     def update(self, layer_idx, k_new, v_new):
         # k_new, v_new: (B, H, T, D)
         B, H, T, D = k_new.shape
-        # We need to update the cache in-place if possible, but JAX is functional.
-        # So we return the updated cache slice?
-        # Or we use nnx.Variable to hold state?
-        # For now, let's assume we return the full concatenated k, v for attention.
+        pos = self.pos.value
         
-        # Actually, implementing KVCache efficiently in JAX requires `jax.lax.dynamic_update_slice`.
-        # But here we are in a Module, maybe we can just return the updated k, v to be used in attention
-        # and the caller manages the state?
-        # Or use `nnx.Variable`.
+        # Update cache using dynamic_update_slice
+        # We need to handle the indices correctly.
+        # k shape: (num_layers, batch_size, n_kv_head, max_len, head_dim)
+        # We want to update at layer_idx, all batch, all heads, from pos to pos+T, all dim
         
-        # Simpler approach for now:
-        # Just return the full k, v including history.
-        # But we need to store it.
+        # JAX dynamic_update_slice takes (operand, slice, start_indices)
+        # This is a bit tricky with multi-dimensional arrays if we only want to update a slice in one dimension.
+        # We can use index_update equivalent or just concatenation for now if it's easier, 
+        # but dynamic_update_slice is better for JIT.
         
-        # Let's assume this KVCache class is used outside of JIT for now, or passed as argument.
-        # If passed as argument, we need to return the new cache.
+        # For simplicity and correctness in JAX NNX, we can do:
+        k_state = self.k.value
+        v_state = self.v.value
         
-        # For this implementation, let's just return the slice needed for attention.
-        # But wait, `CausalSelfAttention` calls `kv_cache.update`.
+        # Prepare start indices for update
+        # (layer_idx, 0, 0, pos, 0)
+        start_indices = (layer_idx, 0, 0, pos, 0)
         
-        # Let's change `update` to return the full sequence for attention.
+        # k_new needs to be reshaped to match the slice shape? 
+        # k_new is (B, H, T, D). Cache is (L, B, H, MaxL, D).
+        # Slice to update is (1, B, H, T, D).
+        # The update `k_new` should directly correspond to the slice `k_state[layer_idx, :, :, pos:pos+T, :]`
+        # So `k_new` itself is the update.
         
-        # This is getting complicated to implement correctly in JAX without `nnx` state handling or explicit passing.
-        # Given the time constraints and "1% dataset" verification, maybe we don't need highly optimized KV cache.
-        # But `engine.py` relies on it.
+        self.k.value = jax.lax.dynamic_update_slice(k_state, k_new, start_indices)
+        self.v.value = jax.lax.dynamic_update_slice(v_state, v_new, start_indices)
         
-        pass
-        return k_new, v_new # Placeholder
+        # Return the full sequence up to current position for attention
+        # Return (B, H, pos+T, D)
+        return self.k.value[layer_idx, :, :, :pos+T, :], self.v.value[layer_idx, :, :, :pos+T, :]
+
+    def increment_pos(self, T):
+        self.pos.value += T
 
     def get_pos(self):
-        return self.pos
+        return self.pos.value

@@ -105,7 +105,7 @@ def build_model(checkpoint_dir, step, device=None, phase="eval"):
     tokenizer = get_tokenizer()
     return model, tokenizer, meta_data
 
-def load_model(source, device=None, phase="eval", model_tag=None, step=None):
+def load_model(source, device=None, phase="eval", model_tag=None, step=None, allow_missing=False, default_config=None):
     model_dir = {
         "base": "base_checkpoints",
         "mid": "mid_checkpoints",
@@ -115,21 +115,34 @@ def load_model(source, device=None, phase="eval", model_tag=None, step=None):
     base_dir = get_base_dir()
     checkpoints_dir = os.path.join(base_dir, model_dir)
     
-    if model_tag is None:
-        # Find largest model (directory with latest step?)
-        # This logic is a bit different with Orbax structure.
-        # Orbax creates subdirs in the checkpoint_dir.
-        # But here `checkpoints_dir` contains `model_tag` directories.
-        # We need to find the `model_tag` directory.
-        if os.path.exists(checkpoints_dir):
-            tags = [d for d in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, d))]
-            if not tags:
-                raise FileNotFoundError(f"No model tags found in {checkpoints_dir}")
-            # Sort by modification time or name
-            tags.sort(key=lambda x: os.path.getmtime(os.path.join(checkpoints_dir, x)), reverse=True)
-            model_tag = tags[0]
-        else:
-            raise FileNotFoundError(f"Checkpoints dir {checkpoints_dir} not found")
+    try:
+        if model_tag is None:
+            # Find largest model (directory with latest step?)
+            if os.path.exists(checkpoints_dir):
+                tags = [d for d in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, d))]
+                if not tags:
+                    raise FileNotFoundError(f"No model tags found in {checkpoints_dir}")
+                # Sort by modification time or name
+                tags.sort(key=lambda x: os.path.getmtime(os.path.join(checkpoints_dir, x)), reverse=True)
+                model_tag = tags[0]
+            else:
+                raise FileNotFoundError(f"Checkpoints dir {checkpoints_dir} not found")
+                
+        checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
+        return build_model(checkpoint_dir, step, device, phase)
+    except (FileNotFoundError, ValueError) as e:
+        if allow_missing:
+            log0(f"Warning: Could not load model from {source} ({e}). Falling back to random initialization.")
+            if default_config is None:
+                # Default config if none provided
+                from nanochat.gpt import GPTConfig
+                tokenizer = get_tokenizer()
+                default_config = GPTConfig(vocab_size=tokenizer.get_vocab_size()) # Use default other params
             
-    checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
-    return build_model(checkpoint_dir, step, device, phase)
+            rngs = nnx.Rngs(0)
+            model = GPT(default_config, rngs=rngs)
+            tokenizer = get_tokenizer()
+            meta = {"step": 0, "model_config": default_config.__dict__}
+            return model, tokenizer, meta
+        else:
+            raise e

@@ -216,18 +216,18 @@ if resuming and 'optim' in restored:
     # Load optimizer state
     # restored['optim'] is the state
     # nnx.Optimizer manages state in .opt_state
-    # We need to update it.
-    # nnx.Optimizer doesn't expose simple load_state_dict?
     # We can update the variable.
     # optimizer.opt_state = restored['optim']
-    # But we need to be careful about structure.
-    # Let's assume it matches.
-    pass # TODO: implement optimizer state loading correctly for NNX
+    # In NNX, opt_state is a PyTree of Variables, so we can use nnx.update if it's wrapped, 
+    # or just assign if it's a direct PyTree.
+    # Orbax restores it as a PyTree.
+    optimizer.opt_state = restored['optim']
 
 # -----------------------------------------------------------------------------
 # Data Loader
 dataloader_resume_state_dict = meta_data.get("dataloader_state_dict") if resuming else None
 train_loader = tokenizing_distributed_data_loader_with_state(device_batch_size, max_seq_len, split="train", resume_state_dict=dataloader_resume_state_dict)
+eval_loader = tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="val")
 
 # -----------------------------------------------------------------------------
 # Train Step
@@ -281,6 +281,19 @@ while step < num_iterations:
     if step % 10 == 0:
         print0(f"Step {step}/{num_iterations} | Loss: {train_loss:.4f} | Time: {dt*1000:.2f}ms")
         wandb_run.log({"train/loss": train_loss, "step": step})
+
+    # Evaluation
+    if eval_every > 0 and step % eval_every == 0:
+        # We need token_bytes for evaluate_bpb
+        token_bytes = get_token_bytes()
+        # evaluate_bpb expects an iterator of (x, y)
+        # eval_loader is already an iterator of (x, y)
+        # We need to limit it to eval_tokens
+        eval_steps = eval_tokens // (device_batch_size * max_seq_len * device_count)
+        if eval_steps > 0:
+            bpb = evaluate_bpb(model, eval_loader, eval_steps, token_bytes)
+            print0(f"Step {step} | BPB: {bpb:.4f}")
+            wandb_run.log({"val/bpb": bpb, "step": step})
 
     # Save
     if save_every > 0 and step % save_every == 0:

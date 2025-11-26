@@ -3,25 +3,22 @@ Finetune a base model to be a chat model.
 Run on one GPU e.g. for debugging:
 
 python -m scripts.chat_sft
-
-Or torchrun for training:
-
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft
 """
 
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
+import time
+import jax
+import jax.numpy as jnp
+from flax import nnx
+import optax
 import wandb
-import torch
-import torch.distributed as dist
-from contextlib import nullcontext
+import numpy as np
 
-from nanochat.common import compute_init, compute_cleanup, get_base_dir, print0, DummyWandb, autodetect_device_type
-from nanochat.checkpoint_manager import load_model
-from nanochat.checkpoint_manager import save_checkpoint
+from nanochat.common import print0, DummyWandb, get_base_dir, setup_default_logging, print_banner
+from nanochat.checkpoint_manager import load_model, CheckpointManager
 from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
+from nanochat.muon import get_muon
 
 from tasks.common import TaskMixture
 from tasks.arc import ARC
@@ -29,6 +26,9 @@ from tasks.gsm8k import GSM8K
 from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
+
+print_banner()
+setup_default_logging()
 
 # -----------------------------------------------------------------------------
 # SFT Hyperparameters
@@ -38,8 +38,6 @@ source = "mid" # base|mid , which checkpoint to load the model from (base model 
 model_tag = None # model tag to load the model from (base model or midtrained model)
 step = None # step to load the model from (base model or midtrained model)
 # compute/precision
-device_type = "" # cuda|cpu|mps (empty => autodetect)
-dtype = "bfloat16"
 device_batch_size = 4 # max to avoid OOM
 # optimization
 num_epochs = 1
@@ -61,21 +59,25 @@ exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from 
 user_config = {k: globals()[k] for k in config_keys} # possibly useful for logging
 # -----------------------------------------------------------------------------
 
-# Compute init
-device_type = autodetect_device_type() if device_type == "" else device_type
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-master_process = ddp_rank == 0
-ptdtype = torch.float32 if dtype == 'float32' else torch.bfloat16
-autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
+# Init JAX Distributed
+try:
+    jax.distributed.initialize()
+except Exception as e:
+    print0(f"JAX distributed init failed (expected if single process): {e}")
+
+process_index = jax.process_index()
+process_count = jax.process_count()
+device_count = jax.device_count()
+print0(f"JAX process: {process_index}/{process_count}, devices: {device_count}")
+master_process = process_index == 0
 
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=run, config=user_config, save_code=True)
 
 # Load the model and tokenizer
-model, tokenizer, meta = load_model(source, device, phase="train", model_tag=model_tag, step=step)
-orig_model = model # original, uncompiled model
-# model = torch.compile(model, dynamic=True) # doesn't work super well because of variable lengths of inputs
+model, tokenizer, meta = load_model(source, phase="train", model_tag=model_tag, step=step, allow_missing=True)
+model_config = model.config
 engine = Engine(model, tokenizer) # will be used for inline model evaluation only
 
 # -----------------------------------------------------------------------------
@@ -97,29 +99,26 @@ val_ds = SmolTalk(split="test") # general conversations, 24K rows (though we don
 
 def sft_data_generator(dataset, batch_size):
     pad_token_id = tokenizer.encode_special("<|assistant_end|>") # use <|assistant_end|> as the pad token is ok, these positions are masked in the loss
-    # prepares a list of tokenized conversations into a batch and yields
+    
     def collate_and_yield(batch):
         nrows = len(batch)
         ncols = max(len(ids) for ids, mask in batch) - 1 # seq of n creates inputs/targets of n-1
-        inputs = torch.full((nrows, ncols), pad_token_id, dtype=torch.long)
-        targets = torch.full((nrows, ncols), -1, dtype=torch.long) # -1 is ignore index
+        inputs = np.full((nrows, ncols), pad_token_id, dtype=np.int32)
+        targets = np.full((nrows, ncols), -1, dtype=np.int32) # -1 is ignore index
         for i, (ids, mask) in enumerate(batch):
             n = len(ids)
-            ids_tensor = torch.tensor(ids, dtype=torch.long)
-            inputs[i, :n-1] = ids_tensor[:-1]
-            # recall -1 is the ignore index, so mask out targets where mask is 0
-            row_targets = ids_tensor[1:]
+            inputs[i, :n-1] = ids[:-1]
             # mask[1:] omits the mask for the BOS token, which is never a target atm so it's ok
-            mask_tensor = torch.tensor(mask[1:], dtype=torch.long)
-            row_targets[mask_tensor == 0] = -1 # mask out targets where mask is 0
+            row_targets = np.array(ids[1:], dtype=np.int32)
+            mask_np = np.array(mask[1:], dtype=np.int32)
+            row_targets[mask_np == 0] = -1 # mask out targets where mask is 0
             targets[i, :n-1] = row_targets
-        inputs = inputs.to(device) # move to device
-        targets = targets.to(device)
         return inputs, targets
+
     # iterates over the dataset in epochs, tokenizes
     batch = []
     while True:
-        for i in range(ddp_rank, len(dataset), ddp_world_size):
+        for i in range(process_index, len(dataset), process_count):
             doc = dataset[i]
             ids, mask = tokenizer.render_conversation(doc)
             batch.append((ids, mask))
@@ -127,10 +126,10 @@ def sft_data_generator(dataset, batch_size):
                 yield collate_and_yield(batch)
                 batch = []
 
-examples_per_step = device_batch_size * ddp_world_size
+examples_per_step = device_batch_size * device_count
 print0(f"Target examples per step: {target_examples_per_step}")
 print0(f"Device batch size: {device_batch_size}")
-print0(f"Examples per step is device_batch_size * ddp_world_size: {examples_per_step}")
+print0(f"Examples per step is device_batch_size * device_count: {examples_per_step}")
 assert target_examples_per_step % examples_per_step == 0, "Target examples per step must be divisible by examples per step"
 grad_accum_steps = target_examples_per_step // examples_per_step
 print0(f"=> Setting grad accum steps: {grad_accum_steps}")
@@ -143,143 +142,121 @@ train_loader = sft_data_generator(train_ds, batch_size=device_batch_size)
 build_val_loader = lambda: sft_data_generator(val_ds, batch_size=device_batch_size)
 
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer
+# Optimizer Setup
+def param_labels(params):
+    def label_fn(param):
+        if hasattr(param, 'value'):
+            param_val = param.value
+        else:
+            param_val = param
+        if param_val.ndim == 2 and param_val.shape[0] > 256 and param_val.shape[1] > 256:
+            return 'muon'
+        return 'adamw'
+    return jax.tree_util.tree_map(label_fn, params)
 
-optimizers = model.setup_optimizers(
-    unembedding_lr=unembedding_lr,
-    embedding_lr=embedding_lr,
-    matrix_lr=matrix_lr,
-    weight_decay=weight_decay,
+def get_schedule_multiplier():
+    if num_iterations > 0:
+        # Linear decay from 1.0 to 0.0
+        return optax.linear_schedule(init_value=1.0, end_value=0.0, transition_steps=num_iterations)
+    return lambda count: 1.0
+
+sched_mult = get_schedule_multiplier()
+
+def make_schedule(base_lr):
+    return lambda count: base_lr * init_lr_frac * sched_mult(count)
+
+adamw_opt = optax.adamw(learning_rate=make_schedule(embedding_lr), weight_decay=weight_decay)
+muon_opt = get_muon(learning_rate=make_schedule(matrix_lr), momentum=0.95)
+
+params = nnx.state(model)
+labels = param_labels(params)
+tx = optax.multi_transform(
+    {'adamw': adamw_opt, 'muon': muon_opt},
+    labels
 )
-# Set the initial learning rate as a fraction of the base learning rate
-for opt in optimizers:
-    for group in opt.param_groups:
-        group["lr"] = group["lr"] * init_lr_frac
-        group["initial_lr"] = group["lr"] # save the initial learning so we can decay easily later
+
+if grad_accum_steps > 1:
+    tx = optax.MultiSteps(tx, every_k_schedule=grad_accum_steps)
+
+optimizer = nnx.Optimizer(model, tx, wrt=nnx.All(nnx.Param))
+
+# -----------------------------------------------------------------------------
+# Training Step
+@nnx.jit
+def train_step(model, optimizer, inputs, targets):
+    def loss_fn(model):
+        loss = model(inputs, targets)
+        return loss
+    
+    loss, grads = nnx.value_and_grad(loss_fn)(model)
+    optimizer.update(grads)
+    return loss
 
 # -----------------------------------------------------------------------------
 # Training loop
-
-# Learning rate scheduler
-def get_lr_multiplier(it):
-    lrm = 1.0 - it / num_iterations
-    return lrm
-
-# Go!
 step = 0
 train_iter = iter(train_loader)
+
+# Checkpoint Manager
+base_dir = get_base_dir()
+output_dirname = f"d{model_config.n_layer}"
+checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+ckpt_mgr = CheckpointManager(checkpoint_dir)
+
 for step in range(num_iterations):
     last_step = step == num_iterations - 1
 
     # evaluate the validation loss
     if last_step or step % eval_every == 0:
-        model.eval()
         val_iter = iter(build_val_loader())
         losses = []
         for _ in range(eval_steps):
             val_inputs, val_targets = next(val_iter)
-            with torch.no_grad(), autocast_ctx:
-                loss = model(val_inputs, val_targets)
-            losses.append(loss)
-        val_loss = torch.stack(losses).mean() # average over eval_steps
-        if ddp:
-            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG) # average over ranks
-        val_loss = val_loss.item()
+            # In JAX, we can just call the model. 
+            # For evaluation, we might want to JIT this too.
+            @nnx.jit
+            def eval_step(model, inputs, targets):
+                return model(inputs, targets)
+            
+            loss = eval_step(model, val_inputs, val_targets)
+            losses.append(float(loss))
+        val_loss = sum(losses) / len(losses)
         print0(f"Step {step:05d} | Validation loss: {val_loss:.6f}")
         wandb_run.log({
             "step": step,
             "val_loss": val_loss,
         })
-        model.train()
-
-    # evaluate accuracy of the multiple choice tasks (which are quick to run)
-    if last_step or (step > 0 and step % eval_metrics_every == 0):
-        model.eval()
-        metrics = {}
-        with torch.no_grad(), autocast_ctx:
-            # note that because these are inside no_grad, we can usually afford to at least ~2X the batch size
-            metrics["mmlu_acc"] = run_chat_eval("MMLU", model, tokenizer, engine, batch_size=device_batch_size*2, max_problems=eval_metrics_max_problems)
-            metrics["arc_easy_acc"] = run_chat_eval("ARC-Easy", model, tokenizer, engine, batch_size=device_batch_size*2, max_problems=eval_metrics_max_problems)
-        metrics_str = ', '.join(f'{k}: {v:.6f}' for k, v in metrics.items())
-        print0(f"Step {step:05d} | {metrics_str}")
-        wandb_run.log({
-            "step": step,
-            **metrics,
-        })
-        model.train()
 
     if last_step:
         break
 
     # evaluate the gradient
-    num_tokens = torch.tensor(0, device=device) # the number of "active" tokens of supervision seen
+    # In JAX, we handle accumulation in optimizer.update via MultiSteps
+    # But we need to feed micro-batches.
+    
+    total_loss = 0
     for micro_step in range(grad_accum_steps):
         train_inputs, train_targets = next(train_iter)
-        with autocast_ctx:
-            loss = model(train_inputs, train_targets)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        loss.backward() # accumulate the gradient
-        num_tokens += (train_targets >= 0).sum()
-    if ddp:
-        dist.all_reduce(num_tokens, op=dist.ReduceOp.SUM) # sum over ranks
-
-    # learning rate scheduler
-    lrm = get_lr_multiplier(step)
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
-
-    # step the optimizers
-    for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
-
+        loss = train_step(model, optimizer, train_inputs, train_targets, 1.0)
+        total_loss += float(loss)
+    
+    avg_loss = total_loss / grad_accum_steps
+    
     # logging
-    train_loss_item = train_loss.item()
-    num_tokens_item = num_tokens.item()
-    print0(f"Step {step:05d}/{num_iterations:05d} | Training loss: {train_loss_item:.6f}| lrm: {lrm:.6f}| num_tokens: {num_tokens_item:,}")
+    print0(f"Step {step:05d}/{num_iterations:05d} | Training loss: {avg_loss:.6f}")
     wandb_run.log({
         "step": step,
-        "lrm": lrm,
-        "train_loss": train_loss_item,
-        "num_tokens": num_tokens_item,
+        "train_loss": avg_loss,
     })
     step += 1
 
 # Save the model at the end of the run
 if master_process:
-    base_dir = get_base_dir()
-    depth = model.config.n_layer
-    model_tag = f"d{depth}" # base the model tag on the depth of the base model
-    checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", model_tag)
-    model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
-    save_checkpoint(
-        checkpoint_dir,
-        step,
-        model.state_dict(),
-        None, # note: we don't bother to save the optimizer state
-        {
-            "step": step,
-            "val_loss": val_loss,
-            **metrics,
-            "model_config": model_config_kwargs,
-        }
-    )
-    print(f"✅ Saved model checkpoint to {checkpoint_dir}")
+    ckpt_mgr.save(step, nnx.state(model), optimizer.opt_state, {
+        "step": step,
+        "model_config": model_config.__dict__,
+        "user_config": user_config,
+    })
+    print0(f"✅ Saved model checkpoint to {checkpoint_dir}")
 
-# Log to report
-from nanochat.report import get_report
-get_report().log(section="Chat SFT", data=[
-    user_config, # CLI args
-    {
-        "Training rows": len(train_ds),
-        "Number of iterations": num_iterations,
-        "Training loss": train_loss_item,
-        "Validation loss": val_loss,
-    },
-])
-
-# Cleanup
 wandb_run.finish()
-compute_cleanup()
