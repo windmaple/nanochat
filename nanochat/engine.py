@@ -120,6 +120,9 @@ class KVCache:
     def advance(self, steps):
         self.pos += steps
 
+    def increment_pos(self, steps):
+        self.pos += steps
+
 # -----------------------------------------------------------------------------
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
     # logits: (B, V)
@@ -196,8 +199,8 @@ class Engine:
         
         # First pass (prefill)
         logits = self.model(ids, kv_cache=kv_cache)
-        # kv_cache.pos is updated? No, I need to update it.
-        kv_cache.advance(ids.shape[1])
+        # kv_cache.pos is updated by the model now
+        # kv_cache.advance(ids.shape[1])
         
         logits = logits[:, -1, :]
         next_ids = sample_next_token(logits, key, temperature, top_k)
@@ -253,7 +256,7 @@ class Engine:
             # Forward
             rng, key = jax.random.split(rng)
             logits = self.model(ids, kv_cache=kv_cache)
-            kv_cache.advance(1)
+            # kv_cache.advance(1)
             
             logits = logits[:, -1, :]
             next_ids = sample_next_token(logits, key, temperature, top_k)

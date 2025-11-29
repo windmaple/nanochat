@@ -33,6 +33,9 @@ def apply_rotary_emb(x, cos, sin):
     out = jnp.concatenate([y1, y2], axis=3)
     return out.astype(x.dtype)
 
+def rms_norm(x, eps=1e-6):
+    return x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
+
 class CausalSelfAttention(nnx.Module):
     def __init__(self, config: GPTConfig, rngs: nnx.Rngs):
         self.config = config
@@ -59,8 +62,8 @@ class CausalSelfAttention(nnx.Module):
         k = apply_rotary_emb(k, cos, sin)
         
         # QK Norm
-        q = nnx.RMSNorm(self.head_dim, use_scale=False)(q)
-        k = nnx.RMSNorm(self.head_dim, use_scale=False)(k)
+        q = rms_norm(q)
+        k = rms_norm(k)
         
         # Transpose to (B, H, T, D)
         q = jnp.transpose(q, (0, 2, 1, 3))
@@ -121,9 +124,8 @@ class Block(nnx.Module):
         self.mlp = MLP(config, rngs=rngs)
 
     def __call__(self, x, cos_sin, mask=None, kv_cache=None, layer_idx=None):
-        norm = lambda x: nnx.RMSNorm(x.shape[-1], use_scale=False)(x)
-        x = x + self.attn(norm(x), cos_sin, mask, kv_cache, layer_idx)
-        x = x + self.mlp(norm(x))
+        x = x + self.attn(rms_norm(x), cos_sin, mask, kv_cache, layer_idx)
+        x = x + self.mlp(rms_norm(x))
         return x
 
 class GPT(nnx.Module):
@@ -133,12 +135,8 @@ class GPT(nnx.Module):
         self.h = nnx.List([Block(config, rngs=rngs) for _ in range(config.n_layer)])
         self.lm_head = nnx.Linear(config.n_embd, config.vocab_size, use_bias=False, rngs=rngs)
         
-        self.rotary_seq_len = config.sequence_len * 10
-        head_dim = config.n_embd // config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        # Store as non-trainable buffers using nnx.Variable
-        self.cos = nnx.Variable(cos)
-        self.sin = nnx.Variable(sin)
+        # We will compute rotary embeddings on the fly in __call__ to avoid issues with NNX state slicing
+        pass
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000):
         channel_range = jnp.arange(0, head_dim, 2, dtype=jnp.float32)
@@ -159,12 +157,14 @@ class GPT(nnx.Module):
         else:
             start_pos = 0
             
-        cos = self.cos.value[:, start_pos:start_pos+T, :, :]
-        sin = self.sin.value[:, start_pos:start_pos+T, :, :]
+        head_dim = self.config.n_embd // self.config.n_head
+        cos, sin = self._precompute_rotary_embeddings(self.config.sequence_len * 10, head_dim)
+        cos = cos[:, start_pos:start_pos+T, :, :]
+        sin = sin[:, start_pos:start_pos+T, :, :]
         cos_sin = (cos, sin)
         
         x = self.wte(idx)
-        x = nnx.RMSNorm(x.shape[-1], use_scale=False)(x)
+        x = rms_norm(x)
         
         for i, block in enumerate(self.h):
             x = block(x, cos_sin, kv_cache=kv_cache, layer_idx=i)
@@ -172,7 +172,7 @@ class GPT(nnx.Module):
         if kv_cache is not None:
             kv_cache.increment_pos(T)
             
-        x = nnx.RMSNorm(x.shape[-1], use_scale=False)(x)
+        x = rms_norm(x)
         
         logits = self.lm_head(x)
         softcap = 15.0

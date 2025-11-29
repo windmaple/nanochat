@@ -168,7 +168,7 @@ def make_schedule(base_lr):
 adamw_opt = optax.adamw(learning_rate=make_schedule(embedding_lr), weight_decay=weight_decay)
 muon_opt = get_muon(learning_rate=make_schedule(matrix_lr), momentum=0.95)
 
-params = nnx.state(model)
+params = nnx.state(model, nnx.Param)
 labels = param_labels(params)
 tx = optax.multi_transform(
     {'adamw': adamw_opt, 'muon': muon_opt},
@@ -189,7 +189,7 @@ def train_step(model, optimizer, inputs, targets):
         return loss
     
     loss, grads = nnx.value_and_grad(loss_fn)(model)
-    optimizer.update(grads)
+    optimizer.update(model, grads)
     return loss
 
 # -----------------------------------------------------------------------------
@@ -237,7 +237,7 @@ for step in range(num_iterations):
     total_loss = 0
     for micro_step in range(grad_accum_steps):
         train_inputs, train_targets = next(train_iter)
-        loss = train_step(model, optimizer, train_inputs, train_targets, 1.0)
+        loss = train_step(model, optimizer, train_inputs, train_targets)
         total_loss += float(loss)
     
     avg_loss = total_loss / grad_accum_steps

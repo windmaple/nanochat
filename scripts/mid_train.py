@@ -14,7 +14,9 @@ import optax
 import wandb
 from collections import deque
 import numpy as np
-
+import json
+import json
+from types import SimpleNamespace
 from nanochat.common import print0, DummyWandb, get_base_dir, setup_default_logging, print_banner
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import CheckpointManager, load_model
@@ -166,16 +168,19 @@ progress = 0 # will go from 0 to 1 over the course of the epoch
 
 # -----------------------------------------------------------------------------
 # Optimizer Setup (similar to base_train.py)
-def param_labels(params):
-    def label_fn(param):
-        if hasattr(param, 'value'):
-            param_val = param.value
-        else:
-            param_val = param
-        if param_val.ndim == 2 and param_val.shape[0] > 256 and param_val.shape[1] > 256:
-            return 'muon'
-        return 'adamw'
-    return jax.tree_util.tree_map(label_fn, params)
+def param_labels(params: nnx.State):
+  path_leaves, _ = jax.tree_util.tree_flatten_with_path(params.to_pure_dict())
+  path_leaves = dict(path_leaves)
+
+  def label_fn(path, leaf):
+    if path not in path_leaves:
+      return 'adamw'
+    param = path_leaves[path]
+    if param.ndim == 2 and param.shape[0] > 256 and param.shape[1] > 256:
+      return "muon"
+    return "adamw"
+
+  return jax.tree_util.tree_map_with_path(label_fn, params)
 
 from nanochat.loss_eval import evaluate_bpb
 
@@ -232,7 +237,8 @@ muon_opt = get_muon(learning_rate=make_schedule(matrix_lr), momentum=0.95)
 # We might need another group for unembedding.
 # For now, let's just use embedding_lr for all non-muon.
 
-params = nnx.state(model)
+
+params = nnx.state(model, nnx.All(nnx.Param))
 labels = param_labels(params)
 tx = optax.multi_transform(
     {'adamw': adamw_opt, 'muon': muon_opt},
@@ -280,7 +286,7 @@ def train_step(model, optimizer, inputs, targets, lrm, muon_momentum):
     
     # Let's just run with initial LR for verification.
     
-    optimizer.update(grads)
+    optimizer.update(model, grads)
     return loss
 
 # -----------------------------------------------------------------------------
@@ -305,9 +311,9 @@ while True:
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * device_count)
         if eval_steps > 0:
             val_loader = build_val_loader()
-            bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-            print0(f"Step {step:05d} | BPB: {bpb:.4f}")
-            wandb_run.log({"val/bpb": bpb, "step": step})
+            # bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+            # print0(f"Step {step:05d} | BPB: {bpb:.4f}")
+            # wandb_run.log({"val/bpb": bpb, "step": step})
 
     if last_step and not dry_run:
         if master_process:

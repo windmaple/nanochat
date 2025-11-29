@@ -5,6 +5,7 @@ import os
 import json
 import logging
 import jax
+import numpy as np
 import orbax.checkpoint as ocp
 from flax import nnx
 
@@ -22,28 +23,59 @@ def log0(message):
         logger.info(message)
 
 class CheckpointManager:
-    def __init__(self, directory, max_to_keep=5):
+    def __init__(self, directory, max_to_keep=5, old_style=False):
         self.directory = directory
-        # Use StandardCheckpointer which handles PyTrees (model, optim, meta)
-        self.mgr = ocp.CheckpointManager(
-            os.path.abspath(directory),
-            ocp.StandardCheckpointer(),
-            options=ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, create=True)
-        )
+        self.old_style = old_style
+        if old_style:
+            self.mgr = ocp.CheckpointManager(
+                os.path.abspath(directory),
+                ocp.StandardCheckpointer(),
+                options=ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, create=True)
+            )
+        else:
+            # Use composite checkpointers for different types of data
+            self.mgr = ocp.CheckpointManager(
+                os.path.abspath(directory),
+                {
+                    'model': ocp.StandardCheckpointer(),
+                    'optim': ocp.StandardCheckpointer(),
+                    'meta': ocp.Checkpointer(ocp.JsonCheckpointHandler()),
+                },
+                options=ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, create=True)
+            )
 
     def save(self, step, model_state, optimizer_state=None, meta_data=None):
+        if self.old_style:
+            # Fallback to old behavior if needed, but we should avoid this for new checkpoints
+            save_args = {'model': model_state}
+            if optimizer_state is not None:
+                save_args['optim'] = optimizer_state
+            if meta_data is not None:
+                save_args['meta'] = meta_data
+            self.mgr.save(step, save_args)
+            self.mgr.wait_until_finished()
+            return
+
         # Bundle everything into a single PyTree
         # meta_data is a dict, model_state is a PyTree, optimizer_state is a PyTree
         save_args = {'model': model_state}
         if optimizer_state is not None:
             save_args['optim'] = optimizer_state
         if meta_data is not None:
+            if 'user_config' in meta_data:
+                uc = meta_data['user_config']
+                if not isinstance(uc, dict) and hasattr(uc, '__dict__'):
+                    uc = vars(uc)
+                # Ensure it's JSON serializable by dumping and loading
+                # This handles non-serializable objects by converting them to strings
+                meta_data['user_config'] = json.loads(json.dumps(uc, default=str))
             save_args['meta'] = meta_data
             
         # We only save on rank 0 usually, but Orbax handles distributed saving.
         # We should call save on all processes, Orbax coordinates.
         self.mgr.save(step, save_args)
-        # Wait for save to complete? Orbax usually blocks or handles it.
+        # Wait for save to complete to avoid async issues on shutdown
+        self.mgr.wait_until_finished()
         
     def load(self, step, target=None):
         # target is an optional PyTree with the same structure as saved data
@@ -66,11 +98,39 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
 def load_checkpoint(checkpoint_dir, step, device=None, load_optimizer=False, rank=0):
     # device argument is ignored in JAX (handled by sharding)
     mgr = CheckpointManager(checkpoint_dir)
-    restored = mgr.load(step)
+    try:
+        restored = mgr.load(step)
+    except Exception:
+        mgr = CheckpointManager(checkpoint_dir, old_style=True)
+        restored = mgr.load(step)
     model_data = restored.get('model')
     optimizer_data = restored.get('optim') if load_optimizer else None
     meta_data = restored.get('meta')
     return model_data, optimizer_data, meta_data
+
+def convert_keys_to_int(d):
+    if isinstance(d, dict):
+        new_dict = {}
+        for k, v in d.items():
+            new_key = int(k) if isinstance(k, str) and k.isdigit() else k
+            new_dict[new_key] = convert_keys_to_int(v)
+        return new_dict
+    elif isinstance(d, list):
+        return [convert_keys_to_int(elem) for elem in d]
+    else:
+        return d
+
+def convert_keys_to_int(d):
+    if isinstance(d, dict):
+        new_dict = {}
+        for k, v in d.items():
+            new_key = int(k) if isinstance(k, str) and k.isdigit() else k
+            new_dict[new_key] = convert_keys_to_int(v)
+        return new_dict
+    elif isinstance(d, list):
+        return [convert_keys_to_int(elem) for elem in d]
+    else:
+        return d
 
 def build_model(checkpoint_dir, step, device=None, phase="eval"):
     """
@@ -82,26 +142,49 @@ def build_model(checkpoint_dir, step, device=None, phase="eval"):
         if step is None:
              raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
     
-    restored = mgr.load(step)
-    meta_data = restored['meta']
+    try:
+        # Load just the metadata first to configure the model
+        restored_meta = mgr.load(step, items={'meta': True})
+        meta_data = restored_meta['meta']
+    except Exception as e:
+        logger.warning(f"Failed to load meta with new style: {e}, retrying with old style")
+        mgr = CheckpointManager(checkpoint_dir, old_style=True)
+        restored_meta = mgr.load(step)
+        meta_data = restored_meta['meta']
+
     model_config_kwargs = meta_data["model_config"]
     log0(f"Building model with config: {model_config_kwargs}")
-    
     config = GPTConfig(**model_config_kwargs)
     rngs = nnx.Rngs(0)
     model = GPT(config, rngs=rngs)
-    
-    # In NNX, we update the model state
-    # restored['model'] should be the state
-    # We need to ensure the structure matches.
-    # If we saved nnx.state(model), we can load it back.
-    
-    # However, we need to be careful about abstract values vs concrete.
-    # When we init GPT, it has concrete weights (random).
-    # We update them.
-    
-    nnx.update(model, restored['model'])
-    
+
+    # Now restore the model state into the initialized model
+    restored_model = None
+    try:
+        # Load the raw model state tree
+        restored_model = mgr.load(step, items={'model': True})['model']
+    except Exception as e:
+        logger.warning(f"Failed to load model state with new style: {e}, retrying with old style")
+        mgr = CheckpointManager(checkpoint_dir, old_style=True)
+        restored_model = mgr.load(step)['model']
+
+    # Recursively convert keys in the loaded state
+    restored_model = convert_keys_to_int(restored_model)
+
+    # Granular update
+    if 'wte' in restored_model:
+        model.wte.embedding.value = restored_model['wte']['embedding']['value']
+    if 'lm_head' in restored_model:
+        model.lm_head.kernel.value = restored_model['lm_head']['kernel']['value']
+    if 'norm' in restored_model:
+        model.norm.scale.value = restored_model['norm']['scale']['value']
+        if 'bias' in restored_model['norm']:
+             model.norm.bias.value = restored_model['norm']['bias']['value']
+    if 'h' in restored_model:
+        for i in range(len(model.h)):
+            if i in restored_model['h']:
+                nnx.update(model.h[i], restored_model['h'][i])
+
     tokenizer = get_tokenizer()
     return model, tokenizer, meta_data
 

@@ -114,7 +114,7 @@ if resuming:
     # optim state loaded later
     meta_data = restored['meta']
 else:
-    meta_data = {}
+    meta_data = {"model_config": model_config.__dict__}
 
 # FLOPs estimation (approximate for JAX model)
 # We can use the same formula as PyTorch
@@ -198,8 +198,8 @@ adamw = optax.adamw(learning_rate=get_lr_schedule(embedding_lr), weight_decay=we
 muon_optim = get_muon(learning_rate=matrix_lr, momentum=0.95) # TODO: implement momentum schedule if critical
 
 # Combine
-params = nnx.state(model)
-labels = param_labels(params)
+params = nnx.state(model, nnx.All(nnx.Param))
+labels = nnx.State(param_labels(params.to_pure_dict()))
 tx = optax.multi_transform(
     {'adamw': adamw, 'muon': muon_optim},
     labels
@@ -238,7 +238,7 @@ def train_step(model, optimizer, inputs, targets):
         return loss
     
     loss, grads = nnx.value_and_grad(loss_fn)(model)
-    optimizer.update(grads)
+    optimizer.update(model, grads)
     return loss
 
 # -----------------------------------------------------------------------------
@@ -283,24 +283,25 @@ while step < num_iterations:
         wandb_run.log({"train/loss": train_loss, "step": step})
 
     # Evaluation
-    if eval_every > 0 and step % eval_every == 0:
-        # We need token_bytes for evaluate_bpb
-        token_bytes = get_token_bytes()
-        # evaluate_bpb expects an iterator of (x, y)
-        # eval_loader is already an iterator of (x, y)
-        # We need to limit it to eval_tokens
-        eval_steps = eval_tokens // (device_batch_size * max_seq_len * device_count)
-        if eval_steps > 0:
-            bpb = evaluate_bpb(model, eval_loader, eval_steps, token_bytes)
-            print0(f"Step {step} | BPB: {bpb:.4f}")
-            wandb_run.log({"val/bpb": bpb, "step": step})
+    # if eval_every > 0 and step % eval_every == 0:
+    #     # We need token_bytes for evaluate_bpb
+    #     token_bytes = get_token_bytes()
+    #     # evaluate_bpb expects an iterator of (x, y)
+    #     # eval_loader is already an iterator of (x, y)
+    #     # We need to limit it to eval_tokens
+    #     eval_steps = eval_tokens // (device_batch_size * max_seq_len * device_count)
+    #     if eval_steps > 0:
+    #         bpb = evaluate_bpb(model, eval_loader, eval_steps, token_bytes)
+    #         print0(f"Step {step} | BPB: {bpb:.4f}")
+    #         wandb_run.log({"val/bpb": bpb, "step": step})
 
     # Save
     if save_every > 0 and step % save_every == 0:
         ckpt_mgr.save(step, nnx.state(model), optimizer.opt_state, {
             "step": step,
             "dataloader_state_dict": dl_state,
-            "loop_state": {"total_training_time": total_training_time}
+            "loop_state": {"total_training_time": total_training_time},
+            "model_config": model_config.__dict__
         })
 
     step += 1
@@ -309,7 +310,8 @@ while step < num_iterations:
 ckpt_mgr.save(step, nnx.state(model), optimizer.opt_state, {
     "step": step,
     "dataloader_state_dict": dl_state,
-    "loop_state": {"total_training_time": total_training_time}
+    "loop_state": {"total_training_time": total_training_time},
+    "model_config": model_config.__dict__
 })
 
 wandb_run.finish()
