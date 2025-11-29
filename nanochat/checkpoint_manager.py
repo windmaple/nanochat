@@ -33,14 +33,8 @@ class CheckpointManager:
                 options=ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, create=True)
             )
         else:
-            # Use composite checkpointers for different types of data
             self.mgr = ocp.CheckpointManager(
                 os.path.abspath(directory),
-                {
-                    'model': ocp.StandardCheckpointer(),
-                    'optim': ocp.StandardCheckpointer(),
-                    'meta': ocp.Checkpointer(ocp.JsonCheckpointHandler()),
-                },
                 options=ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, create=True)
             )
 
@@ -58,29 +52,36 @@ class CheckpointManager:
 
         # Bundle everything into a single PyTree
         # meta_data is a dict, model_state is a PyTree, optimizer_state is a PyTree
-        save_args = {'model': model_state}
+        save_items = {
+            'model': ocp.args.StandardSave(model_state),
+        }
         if optimizer_state is not None:
-            save_args['optim'] = optimizer_state
+            save_items['optim'] = ocp.args.StandardSave(optimizer_state)
         if meta_data is not None:
             if 'user_config' in meta_data:
                 uc = meta_data['user_config']
                 if not isinstance(uc, dict) and hasattr(uc, '__dict__'):
                     uc = vars(uc)
-                # Ensure it's JSON serializable by dumping and loading
-                # This handles non-serializable objects by converting them to strings
                 meta_data['user_config'] = json.loads(json.dumps(uc, default=str))
-            save_args['meta'] = meta_data
-            
-        # We only save on rank 0 usually, but Orbax handles distributed saving.
-        # We should call save on all processes, Orbax coordinates.
-        self.mgr.save(step, save_args)
+            save_items['meta'] = ocp.args.JsonSave(meta_data)
+
+        self.mgr.save(step, args=ocp.args.Composite(**save_items))
         # Wait for save to complete to avoid async issues on shutdown
         self.mgr.wait_until_finished()
         
-    def load(self, step, target=None):
-        # target is an optional PyTree with the same structure as saved data
-        # If target is provided, Orbax restores into it (useful for sharding)
-        return self.mgr.restore(step, items=target)
+    def load(self, step, items=None):
+        if items is None:
+            return self.mgr.restore(step)
+
+        restore_args = {}
+        if 'model' in items:
+            restore_args['model'] = ocp.args.StandardRestore()
+        if 'optim' in items:
+            restore_args['optim'] = ocp.args.StandardRestore()
+        if 'meta' in items:
+            restore_args['meta'] = ocp.args.JsonRestore()
+
+        return self.mgr.restore(step, args=ocp.args.Composite(**restore_args))
 
     def latest_step(self):
         return self.mgr.latest_step()
