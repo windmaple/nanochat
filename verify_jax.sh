@@ -25,10 +25,10 @@ else
   exit 1
 fi
 
-# echo "--- Verifying RL (chat_rl.py) ---"
-# if python -m scripts.chat_rl --num_epochs=1 --device_batch_size=1 --run="dummy"; then
-#   echo "RL successful"
-# else
-#   echo "RL failed"
-#   exit 1
-# fi
+echo "--- Verifying RL (chat_rl.py) ---"
+if python -m scripts.chat_rl --num_epochs=1 --device_batch_size=1 --run="dummy"; then
+  echo "RL successful"
+else
+  echo "RL failed"
+  exit 1
+fi

@@ -209,16 +209,7 @@ examples_per_rank = examples_per_step // process_count # per GPU
 print0(f"Calculated examples per rank: {examples_per_rank}")
 
 # Optimizer Setup
-def param_labels(params):
-    def label_fn(param):
-        if hasattr(param, 'value'):
-            param_val = param.value
-        else:
-            param_val = param
-        if param_val.ndim == 2 and param_val.shape[0] > 256 and param_val.shape[1] > 256:
-            return 'muon'
-        return 'adamw'
-    return jax.tree_util.tree_map(label_fn, params)
+
 
 def get_schedule_multiplier():
     if num_steps > 0:
@@ -231,15 +222,8 @@ sched_mult = get_schedule_multiplier()
 def make_schedule(base_lr):
     return lambda count: base_lr * init_lr_frac * sched_mult(count)
 
-adamw_opt = optax.adamw(learning_rate=make_schedule(embedding_lr), weight_decay=weight_decay)
-muon_opt = get_muon(learning_rate=make_schedule(matrix_lr), momentum=0.95)
 
-params = nnx.state(model)
-labels = param_labels(params)
-tx = optax.multi_transform(
-    {'adamw': adamw_opt, 'muon': muon_opt},
-    labels
-)
+tx = optax.adamw(learning_rate=make_schedule(matrix_lr), weight_decay=weight_decay)
 # No MultiSteps here, we handle accumulation manually if needed, 
 # but the original code did it per example.
 # Wait, the original code did:
@@ -260,62 +244,74 @@ total_micro_batches = examples_per_rank * num_passes
 if total_micro_batches > 1:
     tx = optax.MultiSteps(tx, every_k_schedule=total_micro_batches)
 
-optimizer = nnx.Optimizer(model, tx, wrt=nnx.All(nnx.Param))
+collections = list(nnx.split(model, nnx.Param, ...))
+params = collections.pop(0)
+graph_def = [c for c in collections if isinstance(c, nnx.graph.GraphDef)][0]
+collections.remove(graph_def)
+model_states = collections
+opt_state = tx.init(params)
 
 # -----------------------------------------------------------------------------
 # Training Step
-@nnx.jit
-def train_step(model, optimizer, inputs, targets, advantages):
+def loss_fn(params, model_states, inputs, targets, advantages):
     # advantages is (B,)
-    # inputs is (B, T)
-    # targets is (B, T)
+    # Create a new model instance with the updated parameters
+    model = nnx.merge(graph_def, params, *model_states)
+    logits = model(inputs) # (B, T, V)
+    # Calculate log_probs
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    # Get log_prob of target tokens
+    # targets has -1 for ignored tokens. We need to handle this.
+
+    # One-hot encoding of targets, handling -1
+    # Mask for valid targets
+    mask = (targets != -1)
+    # Replace -1 with 0 for indexing, we will mask out later
+    targets_safe = jnp.where(mask, targets, 0)
+
+    # Gather log_probs
+    # log_probs is (B, T, V), targets_safe is (B, T)
+    # We want (B, T)
+    gathered_log_probs = jnp.take_along_axis(log_probs, targets_safe[..., None], axis=-1).squeeze(-1)
+
+    # Apply mask
+    gathered_log_probs = gathered_log_probs * mask
+
+    # PG objective: sum(log_prob * advantage) per sequence
+    # advantages is (B,)
+    # gathered_log_probs is (B, T)
+    # We want sum over T, then multiply by advantage, then sum over B.
+
+    seq_log_probs = jnp.sum(gathered_log_probs, axis=-1) # (B,)
+    pg_obj = seq_log_probs * jax.lax.stop_gradient(advantages) # (B,)
+
+    # Normalize by number of valid tokens?
+    num_valid = jnp.sum(mask).astype(jnp.float32)
+    num_valid = jnp.maximum(num_valid, 1.0)
+
+    loss = -jnp.sum(pg_obj) / num_valid # Average over valid tokens in this batch
     
-    def loss_fn(model):
-        logits = model(inputs) # (B, T, V)
-        # Calculate log_probs
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
-        # Get log_prob of target tokens
-        # targets has -1 for ignored tokens. We need to handle this.
-        
-        # One-hot encoding of targets, handling -1
-        # Mask for valid targets
-        mask = (targets != -1)
-        # Replace -1 with 0 for indexing, we will mask out later
-        targets_safe = jnp.where(mask, targets, 0)
-        
-        # Gather log_probs
-        # log_probs is (B, T, V), targets_safe is (B, T)
-        # We want (B, T)
-        gathered_log_probs = jnp.take_along_axis(log_probs, targets_safe[..., None], axis=-1).squeeze(-1)
-        
-        # Apply mask
-        gathered_log_probs = gathered_log_probs * mask
-        
-        # PG objective: sum(log_prob * advantage) per sequence
-        # advantages is (B,)
-        # gathered_log_probs is (B, T)
-        # We want sum over T, then multiply by advantage, then sum over B.
-        
-        seq_log_probs = jnp.sum(gathered_log_probs, axis=-1) # (B,)
-        pg_obj = seq_log_probs * advantages # (B,)
-        
-        # Normalize by number of valid tokens?
-        # Original code did: pg_obj = pg_obj / (num_valid * num_passes * examples_per_rank)
-        # Here we are inside a single micro-batch.
-        # Optax MultiSteps will handle averaging over micro-batches if we return mean loss.
-        # But we want sum of PG obj, then divide by total tokens later?
-        # Actually, Optax MultiSteps averages the gradients.
-        # So we should return the loss for this micro-batch.
-        
-        num_valid = jnp.sum(mask).astype(jnp.float32)
-        num_valid = jnp.maximum(num_valid, 1.0)
-        
-        loss = -jnp.sum(pg_obj) / num_valid # Average over valid tokens in this batch
-        return loss
+    # Split the updated model to get the new states
+    collections = list(nnx.split(model, nnx.Param, ...))
+    collections.pop(0) # remove params
+    collections.remove(graph_def)
+    new_model_states = collections
     
-    loss, grads = nnx.value_and_grad(loss_fn)(model)
-    optimizer.update(grads)
-    return loss
+    return loss, new_model_states
+
+grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
+
+@jax.jit
+def train_step(params, model_states, opt_state, inputs, targets, advantages):
+    (loss, new_model_states), grads = grad_fn(params, model_states, inputs, targets, advantages)
+    updates, opt_state = tx.update(grads, opt_state, params)
+    params = optax.apply_updates(params, updates)
+    return params, new_model_states, opt_state, loss
+
+# -----------------------------------------------------------------------------
+
+
+train_step = jax.jit(train_step, static_argnums=1)
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -380,7 +376,7 @@ for step in range(num_steps):
             advantages = advantages_all[b0:b1]
             
             # Run JIT'd train step
-            loss = train_step(model, optimizer, inputs, targets, advantages)
+            params, model_states, opt_state, loss = train_step(params, model_states, opt_state, inputs, targets, advantages)
             
             print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {float(loss):.6f} | Average reward: {rewards.mean():.4f}")
         
@@ -410,11 +406,12 @@ for step in range(num_steps):
 
     # Master process saves the model once in a while. Skip first step. Save last step.
     if master_process and ((step > 0 and step % save_every == 0) or step == num_steps - 1):
-        ckpt_mgr.save(step, nnx.state(model), optimizer.opt_state, {
+        # Before saving, merge the updated params back into the model object
+        nnx.update(model, params, *model_states)
+        ckpt_mgr.save(step, nnx.state(model), opt_state, {
             "step": step,
             "model_config": model_config.__dict__,
             "user_config": user_config,
         })
-        print0(f"✅ Saved model checkpoint to {checkpoint_dir}")
 
 wandb_run.finish()
