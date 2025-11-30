@@ -36,6 +36,54 @@ def apply_rotary_emb(x, cos, sin):
 def rms_norm(x, eps=1e-6):
     return x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
 
+class KVCache(nnx.Module):
+    def __init__(self, batch_size, num_layers, n_kv_head, head_dim, max_len):
+        self.k = nnx.Variable(jnp.zeros((num_layers, batch_size, n_kv_head, max_len, head_dim)))
+        self.v = nnx.Variable(jnp.zeros((num_layers, batch_size, n_kv_head, max_len, head_dim)))
+        self.pos = nnx.Variable(0)
+        
+    def update(self, layer_idx, k_new, v_new):
+        # k_new, v_new: (B, H, T, D)
+        B, H, T, D = k_new.shape
+        pos = self.pos.value
+        
+        # Update cache using dynamic_update_slice
+        # We need to handle the indices correctly.
+        # k shape: (num_layers, batch_size, n_kv_head, max_len, head_dim)
+        # We want to update at layer_idx, all batch, all heads, from pos to pos+T, all dim
+        
+        # JAX dynamic_update_slice takes (operand, slice, start_indices)
+        # This is a bit tricky with multi-dimensional arrays if we only want to update a slice in one dimension.
+        # We can use index_update equivalent or just concatenation for now if it's easier, 
+        # but dynamic_update_slice is better for JIT.
+        
+        # For simplicity and correctness in JAX NNX, we can do:
+        k_state = self.k.value
+        v_state = self.v.value
+        
+        # Prepare start indices for update
+        # (layer_idx, 0, 0, pos, 0)
+        start_indices = (layer_idx, 0, 0, pos, 0)
+        
+        # k_new needs to be reshaped to match the slice shape? 
+        # k_new is (B, H, T, D). Cache is (L, B, H, MaxL, D).
+        # Slice to update is (1, B, H, T, D).
+        # The update `k_new` should directly correspond to the slice `k_state[layer_idx, :, :, pos:pos+T, :]`
+        # So `k_new` itself is the update.
+        
+        self.k.value = jax.lax.dynamic_update_slice(k_state, k_new, start_indices)
+        self.v.value = jax.lax.dynamic_update_slice(v_state, v_new, start_indices)
+        
+        # Return the full sequence up to current position for attention
+        # Return (B, H, pos+T, D)
+        return self.k.value[layer_idx, :, :, :pos+T, :], self.v.value[layer_idx, :, :, :pos+T, :]
+
+    def increment_pos(self, T):
+        self.pos.value += T
+
+    def get_pos(self):
+        return self.pos.value
+
 class CausalSelfAttention(nnx.Module):
     def __init__(self, config: GPTConfig, rngs: nnx.Rngs):
         self.config = config
@@ -186,51 +234,3 @@ class GPT(nnx.Module):
             return loss
         else:
             return logits
-
-class KVCache(nnx.Module):
-    def __init__(self, batch_size, num_layers, n_kv_head, head_dim, max_len):
-        self.k = nnx.Variable(jnp.zeros((num_layers, batch_size, n_kv_head, max_len, head_dim)))
-        self.v = nnx.Variable(jnp.zeros((num_layers, batch_size, n_kv_head, max_len, head_dim)))
-        self.pos = nnx.Variable(0)
-        
-    def update(self, layer_idx, k_new, v_new):
-        # k_new, v_new: (B, H, T, D)
-        B, H, T, D = k_new.shape
-        pos = self.pos.value
-        
-        # Update cache using dynamic_update_slice
-        # We need to handle the indices correctly.
-        # k shape: (num_layers, batch_size, n_kv_head, max_len, head_dim)
-        # We want to update at layer_idx, all batch, all heads, from pos to pos+T, all dim
-        
-        # JAX dynamic_update_slice takes (operand, slice, start_indices)
-        # This is a bit tricky with multi-dimensional arrays if we only want to update a slice in one dimension.
-        # We can use index_update equivalent or just concatenation for now if it's easier, 
-        # but dynamic_update_slice is better for JIT.
-        
-        # For simplicity and correctness in JAX NNX, we can do:
-        k_state = self.k.value
-        v_state = self.v.value
-        
-        # Prepare start indices for update
-        # (layer_idx, 0, 0, pos, 0)
-        start_indices = (layer_idx, 0, 0, pos, 0)
-        
-        # k_new needs to be reshaped to match the slice shape? 
-        # k_new is (B, H, T, D). Cache is (L, B, H, MaxL, D).
-        # Slice to update is (1, B, H, T, D).
-        # The update `k_new` should directly correspond to the slice `k_state[layer_idx, :, :, pos:pos+T, :]`
-        # So `k_new` itself is the update.
-        
-        self.k.value = jax.lax.dynamic_update_slice(k_state, k_new, start_indices)
-        self.v.value = jax.lax.dynamic_update_slice(v_state, v_new, start_indices)
-        
-        # Return the full sequence up to current position for attention
-        # Return (B, H, pos+T, D)
-        return self.k.value[layer_idx, :, :, :pos+T, :], self.v.value[layer_idx, :, :, :pos+T, :]
-
-    def increment_pos(self, T):
-        self.pos.value += T
-
-    def get_pos(self):
-        return self.pos.value

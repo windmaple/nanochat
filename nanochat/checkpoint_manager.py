@@ -172,19 +172,9 @@ def build_model(checkpoint_dir, step, device=None, phase="eval"):
     # Recursively convert keys in the loaded state
     restored_model = convert_keys_to_int(restored_model)
 
-    # Granular update
-    if 'wte' in restored_model:
-        model.wte.embedding.value = restored_model['wte']['embedding']['value']
-    if 'lm_head' in restored_model:
-        model.lm_head.kernel.value = restored_model['lm_head']['kernel']['value']
-    if 'norm' in restored_model:
-        model.norm.scale.value = restored_model['norm']['scale']['value']
-        if 'bias' in restored_model['norm']:
-             model.norm.bias.value = restored_model['norm']['bias']['value']
-    if 'h' in restored_model:
-        for i in range(len(model.h)):
-            if i in restored_model['h']:
-                nnx.update(model.h[i], restored_model['h'][i])
+    # Create a state object from the restored dictionary and update the model
+    restored_state = nnx.State(restored_model)
+    nnx.update(model, restored_state)
 
     tokenizer = get_tokenizer()
     return model, tokenizer, meta_data

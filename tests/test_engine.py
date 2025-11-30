@@ -4,7 +4,8 @@ Test Engine class. Example run:
 python -m pytest tests/test_engine.py -v
 """
 
-import torch
+import jax.numpy as jnp
+import numpy as np
 from nanochat.engine import KVCache
 
 def test_kv_cache_resize():
@@ -31,8 +32,8 @@ def test_kv_cache_resize():
     # Insert a single token with a distinct fill value to all layers
     def insert_token(token_idx):
         for layer_idx in range(num_layers):
-            k = torch.full((batch_size, num_heads, 1, head_dim), fill_value=float(token_idx), dtype=torch.float32)
-            v = torch.full((batch_size, num_heads, 1, head_dim), fill_value=float(token_idx * 100), dtype=torch.float32)
+            k = jnp.full((batch_size, num_heads, 1, head_dim), fill_value=float(token_idx), dtype=jnp.float32)
+            v = jnp.full((batch_size, num_heads, 1, head_dim), fill_value=float(token_idx * 100), dtype=jnp.float32)
             kv_cache.insert_kv(layer_idx, k, v)
 
     # Insert 4 tokens (fills the initial seq_len=4)
@@ -40,7 +41,7 @@ def test_kv_cache_resize():
         insert_token(i)
 
     # Record the original state of the cache
-    original_cache = kv_cache.kv_cache.clone()
+    original_cache = kv_cache.kv_cache.copy()
     original_seq_len = original_cache.shape[4]
 
     # Insert the 5th token, which will trigger a resize
@@ -57,10 +58,10 @@ def test_kv_cache_resize():
             expected_v = float(token_idx * 100)
             actual_k = kv_cache.kv_cache[layer_idx, 0, :, :, token_idx, :]
             actual_v = kv_cache.kv_cache[layer_idx, 1, :, :, token_idx, :]
-            assert (actual_k == expected_k).all(), f"Layer {layer_idx}, token {token_idx}: key corrupted, expected {expected_k}"
-            assert (actual_v == expected_v).all(), f"Layer {layer_idx}, token {token_idx}: value corrupted, expected {expected_v}"
+            assert np.all(actual_k == expected_k), f"Layer {layer_idx}, token {token_idx}: key corrupted, expected {expected_k}"
+            assert np.all(actual_v == expected_v), f"Layer {layer_idx}, token {token_idx}: value corrupted, expected {expected_v}"
             # And that the original cache matches resized cache
             original_k = original_cache[layer_idx, 0, :, :, token_idx, :]
             original_v = original_cache[layer_idx, 1, :, :, token_idx, :]
-            assert (actual_k == original_k).all(), f"Layer {layer_idx}, token {token_idx}: key doesn't match original"
-            assert (actual_v == original_v).all(), f"Layer {layer_idx}, token {token_idx}: value doesn't match original"
+            assert np.all(actual_k == original_k), f"Layer {layer_idx}, token {token_idx}: key doesn't match original"
+            assert np.all(actual_v == original_v), f"Layer {layer_idx}, token {token_idx}: value doesn't match original"

@@ -10,12 +10,11 @@ torchrun --nproc_per_node=8 -m scripts.chat_eval -- -a ARC-Easy
 
 import argparse
 from functools import partial
-from contextlib import nullcontext
+import jax
+import jax.numpy as jnp
+import numpy as np
 
-import torch
-import torch.distributed as dist
-
-from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
+from nanochat.common import print0
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
 
@@ -30,20 +29,20 @@ from tasks.spellingbee import SpellingBee
 
 def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None):
 
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
-    device = model.get_device()
+    process_index = jax.process_index()
+    process_count = jax.process_count()
 
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
 
     # Run the evaluation
     num_passed, total = 0, 0
-    for i in range(ddp_rank, num_problems, ddp_world_size):
+    for i in range(process_index, num_problems, process_count):
         conversation = task_object[i]
 
         # Tokenize the prompt
         encoded_prompt = tokenizer.render_for_completion(conversation)
         # Get the completions
-        results, _ = engine.generate_batch(
+        results, _ = engine.generate(
             encoded_prompt,
             num_samples=num_samples,
             max_tokens=max_new_tokens,
@@ -62,19 +61,14 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
         num_passed += int(passed)
 
         # Logging (overwrite the same line in the console)
-        print(f"\r\033[KRank {ddp_rank} | {num_passed}/{total} ({100*num_passed/total:.2f}%)", end='', flush=True)
+        print(f"\r\033[KRank {process_index} | {num_passed}/{total} ({100*num_passed/total:.2f}%)", end='', flush=True)
 
     # Finish the in-place progress line with a newline before final summary
     print()
 
     # Aggregate results across all ranks
-    if ddp:
-        num_passed_tensor = torch.tensor([num_passed], dtype=torch.long, device=device)
-        total_tensor = torch.tensor([total], dtype=torch.long, device=device)
-        dist.all_reduce(num_passed_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-        num_passed = num_passed_tensor.item()
-        total = total_tensor.item()
+    num_passed = jax.lax.psum(num_passed, axis_name='i')
+    total = jax.lax.psum(total, axis_name='i')
 
     print0("=" * 50)
     print0(f"Final: {num_passed}/{total} ({100*num_passed/total:.2f}%)")
@@ -89,8 +83,8 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
 def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=None):
 
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
-    device = model.get_device()
+    process_index = jax.process_index()
+    process_count = jax.process_count()
     bos = tokenizer.get_bos_token_id() # use BOS as pad token is ok, these positions are ignored
 
     # We'll process batches of independent problems at a time because there is no sampling needed
@@ -101,20 +95,19 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
     # Run the evaluation
     letter_to_id_cache = {} # many letters will repeat often, let's save the tokenizer some work
     num_passed, total = 0, 0
-    for i in range(ddp_rank, num_batches, ddp_world_size):
+    for i in range(process_index, num_batches, process_count):
         i0, i1 = i * batch_size, min((i + 1) * batch_size, num_problems)
 
         # Prepare the batch of problems. They might all be of different length, so we pad/collate them.
         conversations = [task_object[ii] for ii in range(i0, i1)]
-        prompt_ids = [tokenizer.render_for_completion(conversation) for conversation in conversations] # TODO: remake the way this works
+        prompt_ids = [tokenizer.render_for_completion(conversation) for conversation in conversations]
         max_length = max(len(ids) for ids in prompt_ids)
         answer_time_positions = [len(ids) - 1 for ids in prompt_ids] # where the last token is (and the predicted answer)
         padded_prompt_ids = [ids + [bos] * (max_length - len(ids)) for ids in prompt_ids]
-        prompt_ids = torch.tensor(padded_prompt_ids, dtype=torch.long, device=device)
+        prompt_ids = jnp.array(padded_prompt_ids, dtype=jnp.int32)
 
         # Get the logits for the whole batch of conversations in parallel (efficiency win here)
-        with torch.no_grad():
-            logits = model(prompt_ids) # (B, T, V)
+        logits = model(prompt_ids)
 
         # Focus on the available answer on just the letters corresponding to choices
         # Note that this helps the evaluation a lot because it specifically narrows the focus to only the available letters
@@ -134,21 +127,16 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
             answer_pos = answer_time_positions[idx]
             focus_logits = logits[idx, answer_pos, letter_ids]
             # get the argmax letter (the predicted answer)
-            argmax_letter_id = focus_logits.argmax(dim=-1).item()
-            predicted_letter = letters[argmax_letter_id]
+            argmax_letter_idx = int(focus_logits.argmax(axis=-1))
+            predicted_letter = letters[argmax_letter_idx]
             # evaluate the outcome
             outcome = task_object.evaluate(conversation, predicted_letter)
             num_passed += int(outcome)
             total += 1
 
     # Aggregate results across all ranks
-    if ddp:
-        num_passed_tensor = torch.tensor([num_passed], dtype=torch.long, device=device)
-        total_tensor = torch.tensor([total], dtype=torch.long, device=device)
-        dist.all_reduce(num_passed_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-        num_passed = num_passed_tensor.item()
-        total = total_tensor.item()
+    num_passed = jax.lax.psum(num_passed, axis_name='i')
+    total = jax.lax.psum(total, axis_name='i')
 
     average = num_passed/total
     print0(f"Final: {num_passed}/{total} ({100*average:.2f}%)")
@@ -194,15 +182,14 @@ if __name__ == "__main__":
     parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load')
     parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
     parser.add_argument('-x', '--max-problems', type=int, default=None, help='Max problems to evaluate')
-    parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
     args = parser.parse_args()
 
-    device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-    ptdtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
-    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
+    try:
+        jax.distributed.initialize()
+    except Exception as e:
+        print0(f"JAX distributed init failed (expected if single process): {e}")
 
-    model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
+    model, tokenizer, meta = load_model(args.source, phase="eval", model_tag=args.model_tag, step=args.step)
     engine = Engine(model, tokenizer)
 
     # Get the tasks to evaluate on
@@ -220,19 +207,18 @@ if __name__ == "__main__":
     # Run all the task evaluations sequentially
     results = {}
     for task_name in task_names:
-        with autocast_ctx:
-            acc = run_chat_eval(
-                task_name,
-                model, tokenizer, engine,
-                batch_size=args.batch_size,
-                num_samples=args.num_samples,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_k=args.top_k,
-                max_problems=args.max_problems,
-            )
-            results[task_name] = acc
-            print0(f"{task_name} accuracy: {100 * acc:.2f}%")
+        acc = run_chat_eval(
+            task_name,
+            model, tokenizer, engine,
+            batch_size=args.batch_size,
+            num_samples=args.num_samples,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            max_problems=args.max_problems,
+        )
+        results[task_name] = acc
+        print0(f"{task_name} accuracy: {100 * acc:.2f}%")
 
     # Log to report
     from nanochat.report import get_report
@@ -253,5 +239,3 @@ if __name__ == "__main__":
         results,
         chatcore_metric_dict,
     ])
-
-    compute_cleanup()

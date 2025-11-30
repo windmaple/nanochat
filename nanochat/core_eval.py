@@ -8,8 +8,11 @@ TODOs:
 import random
 
 from jinja2 import Template
-import torch
-import torch.distributed as dist
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from flax import nnx
 
 # -----------------------------------------------------------------------------
 # Prompt rendering utilities
@@ -103,11 +106,9 @@ def find_common_length(token_sequences, direction='left'):
 
 def stack_sequences(tokens, pad_token_id):
     """Stack up a list of token sequences, pad to longest on the right"""
-    bsz, seq_len = len(tokens), max(len(x) for x in tokens)
-    input_ids = torch.full((bsz, seq_len), pad_token_id, dtype=torch.long)
-    for i, x in enumerate(tokens):
-        input_ids[i, :len(x)] = torch.tensor(x, dtype=torch.long)
-    return input_ids
+    seq_len = max(len(x) for x in tokens)
+    padded = [x + [pad_token_id] * (seq_len - len(x)) for x in tokens]
+    return jnp.array(padded, dtype=jnp.int32)
 
 
 def batch_sequences_mc(tokenizer, prompts):
@@ -141,31 +142,28 @@ def batch_sequences_lm(tokenizer, prompts):
     return [tokens_with], [start_idx], [end_idx]
 
 
-@torch.no_grad()
 def forward_model(model, input_ids):
     """
     Take BxT tensor of token ids, return BxT tensor of losses and argmax predictions.
     The last column of losses is set to nan because we don't have autoregressive targets there.
     """
-    batch_size, seq_len = input_ids.size()
-    outputs = model(input_ids)
+    batch_size, seq_len = input_ids.shape
+    logits = model(input_ids)
     # Roll the tensor to the left by one position to get the (autoregressive) target ids
-    target_ids = torch.roll(input_ids, shifts=-1, dims=1)
+    target_ids = jnp.roll(input_ids, shift=-1, axis=1)
     # Calculate cross entropy at all positions
-    losses = torch.nn.functional.cross_entropy(
-        outputs.view(batch_size * seq_len, -1),
-        target_ids.view(batch_size * seq_len),
-        reduction='none'
-    ).view(batch_size, seq_len)
+    losses = optax.softmax_cross_entropy_with_integer_labels(
+        logits=logits.reshape(batch_size * seq_len, -1),
+        labels=target_ids.reshape(batch_size * seq_len)
+    ).reshape(batch_size, seq_len)
     # Set the last column to be nan because there is no autoregressive loss there
-    losses[:, -1] = float('nan')
+    losses = losses.at[:, -1].set(jnp.nan)
     # Get the argmax predictions at each position
-    predictions = outputs.argmax(dim=-1)
+    predictions = logits.argmax(axis=-1)
     return losses, predictions
 
 
-@torch.no_grad()
-def evaluate_example(idx, model, tokenizer, data, device, task_meta):
+def evaluate_example(idx, model, tokenizer, data, task_meta):
     """Evaluate a single example, return True if correct, False otherwise"""
     item = data[idx]
     task_type = task_meta['task_type']
@@ -215,7 +213,6 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     # Stack up all the sequences into a batch
     pad_token_id = tokenizer.get_bos_token_id() # use BOS as pad token is ok
     input_ids = stack_sequences(tokens, pad_token_id)
-    input_ids = input_ids.to(device)
 
     # Forward the model, get the autoregressive loss and argmax prediction at each token
     losses, predictions = forward_model(model, input_ids)
@@ -228,7 +225,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
         # predictions[i] predict input_ids[i+1] autoregressively
         predicted_tokens = predictions[0, si-1:ei-1]
         actual_tokens = input_ids[0, si:ei]
-        is_correct = torch.all(predicted_tokens == actual_tokens).item()
+        is_correct = jnp.all(predicted_tokens == actual_tokens).item()
     elif task_type in ['multiple_choice', 'schema']:
         # For MC/schema: find the option with lowest average loss
         mean_losses = [losses[i, si-1:ei-1].mean().item()
@@ -241,22 +238,24 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     return is_correct
 
 
-def evaluate_task(model, tokenizer, data, device, task_meta):
+def evaluate_task(model, tokenizer, data, task_meta):
     """
     This function is responsible for evaluating one task across many examples.
     It also handles dispatch to all processes if the script is run with torchrun.
     """
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    correct = torch.zeros(len(data), dtype=torch.float32, device=device)
+    process_index = jax.process_index()
+    process_count = jax.process_count()
+    num_correct = 0
+    num_total = 0
     # stride the examples to each rank
-    for idx in range(rank, len(data), world_size):
-        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
-        correct[idx] = float(is_correct)
+    for idx in range(process_index, len(data), process_count):
+        is_correct = evaluate_example(idx, model, tokenizer, data, task_meta)
+        num_correct += int(is_correct)
+        num_total += 1
     # sync results across all the processes if running distributed
-    if world_size > 1:
-        dist.barrier()
-        dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+    if process_count > 1:
+        num_correct = jax.lax.psum(num_correct, axis_name='i')
+        num_total = jax.lax.psum(num_total, axis_name='i')
     # compute the mean
-    mean_correct = correct.mean().item()
+    mean_correct = num_correct / num_total if num_total > 0 else 0
     return mean_correct

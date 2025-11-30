@@ -2,7 +2,7 @@ from collections import deque
 import numpy as np
 import pyarrow.parquet as pq
 
-from nanochat.common import get_dist_info
+import jax
 from nanochat.dataset import list_parquet_files
 from nanochat.tokenizer import get_tokenizer
 
@@ -22,7 +22,8 @@ def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
     # infinite iterator over document batches (list of text strings)
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    process_index = jax.process_index()
+    process_count = jax.process_count()
     def document_batches():
         parquet_paths = list_parquet_files()
         parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
@@ -36,19 +37,19 @@ def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads
                 # Start from resume point if resuming on same file, otherwise from DDP rank
                 # I know this state resumption is a little bit tricky and a little bit hacky... sigh.
                 if resume_rg_idx is not None:
-                    base_idx = resume_rg_idx // ddp_world_size # in units of ddp_world_size
+                    base_idx = resume_rg_idx // process_count # in units of process_count
                     base_idx += 1 # advance by 1 so that we definitely don't repeat data after resuming
-                    rg_idx = base_idx * ddp_world_size + ddp_rank
+                    rg_idx = base_idx * process_count + process_index
                     resume_rg_idx = None # set to None as we only want to do this a single time
                 else:
-                    rg_idx = ddp_rank
+                    rg_idx = process_index
                 while rg_idx < pf.num_row_groups:
                     rg = pf.read_row_group(rg_idx)
                     batch = rg.column('text').to_pylist() # each batch is a parquet group, e.g. 1024 rows
                     # the tokenizer encode might want to go in even smaller batches, e.g. 128 rows
                     for i in range(0, len(batch), tokenizer_batch_size):
                         yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx)
-                    rg_idx += ddp_world_size # advance to the next row group (in DDP)
+                    rg_idx += process_count # advance to the next row group (in DDP)
                 pq_idx += 1 # advance to the next parquet file
     batches = document_batches()
 

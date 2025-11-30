@@ -20,9 +20,9 @@ import zipfile
 import tempfile
 from contextlib import nullcontext
 
-import torch
+import jax
 
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
+from nanochat.common import print0, get_base_dir, download_file_with_lock
 from nanochat.tokenizer import HuggingFaceTokenizer
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
@@ -45,7 +45,7 @@ def place_eval_bundle(file_path):
         shutil.move(extracted_bundle_dir, eval_bundle_dir)
     print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
-def evaluate_model(model, tokenizer, device, max_per_task=-1):
+def evaluate_model(model, tokenizer, max_per_task=-1):
     """
     Evaluate a base model on the CORE benchmark.
     - max_per_task: crop the data to this many examples per task for testing (-1 = disable)
@@ -99,7 +99,7 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1):
             data = data[:max_per_task]
 
         # run the evaluation for this task
-        accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
+        accuracy = evaluate_task(model, tokenizer, data, task_meta)
 
         results[label] = accuracy
         random_baseline = random_baselines[label]
@@ -130,12 +130,11 @@ class ModelWrapper:
         logits = outputs.logits
         return logits
 
-def load_hf_model(hf_path: str, device):
+def load_hf_model(hf_path: str):
     print0(f"Loading model from: {hf_path}")
     # Load the model
     from transformers import AutoModelForCausalLM
     model = AutoModelForCausalLM.from_pretrained(hf_path)
-    model.to(device)
     model.eval()
     max_seq_len = 1024 if "openai-community/gpt2" in hf_path else None
     model = ModelWrapper(model, max_seq_len=max_seq_len)
@@ -151,33 +150,36 @@ def main():
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per task to evaluate (-1 = disable)')
     args = parser.parse_args()
 
-    # distributed / precision setup
-    device_type = autodetect_device_type()
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+    # JAX distributed setup
+    try:
+        jax.distributed.initialize()
+    except Exception as e:
+        print0(f"JAX distributed init failed (expected if single process): {e}")
+
+    process_index = jax.process_index()
+    master_process = process_index == 0
 
     # Load model and tokenizer from command line or from file system
     if args.hf_path is not None:
         # atm assume that if a path is given, it's a huggingface model path
         hf_path = args.hf_path
         print0(f"Loading huggingface model from: {hf_path}")
-        model, tokenizer = load_hf_model(hf_path, device)
+        model, tokenizer = load_hf_model(hf_path)
         model_name = hf_path # just for logging
         model_slug = hf_path.replace("/", "-") # for the output csv file
     else:
         # load a local model from the file system
-        model, tokenizer, meta = load_model("base", device, phase="eval")
+        model, tokenizer, meta = load_model("base", phase="eval")
         model_name = f"base_model (step {meta['step']})" # just for logging
         model_slug = f"base_model_{meta['step']:06d}" # for the output csv file
 
     # Evaluate the model
-    with autocast_ctx:
-        out = evaluate_model(model, tokenizer, device, max_per_task=args.max_per_task)
+    out = evaluate_model(model, tokenizer, max_per_task=args.max_per_task)
 
     # Write out the results to a csv file
     core_metric = None
     centered_results = {}
-    if ddp_rank == 0:
+    if master_process:
         base_dir = get_base_dir()
         output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
         os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
@@ -205,8 +207,6 @@ def main():
         },
         centered_results, # the full table
     ])
-
-    compute_cleanup()
 
 if __name__ == "__main__":
     main()

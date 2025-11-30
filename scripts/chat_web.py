@@ -33,7 +33,7 @@ Abuse Prevention:
 import argparse
 import json
 import os
-import torch
+import jax
 import asyncio
 import logging
 import random
@@ -44,8 +44,6 @@ from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, AsyncGenerator
 from dataclasses import dataclass
-from contextlib import nullcontext
-from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
 
@@ -70,7 +68,6 @@ parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag
 parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
 parser.add_argument('-p', '--port', type=int, default=8000, help='Port to run the server on')
 parser.add_argument('-d', '--dtype', type=str, default='bfloat16', choices=['float32', 'bfloat16'])
-parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
 parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind the server to')
 args = parser.parse_args()
 
@@ -82,28 +79,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-ptdtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
-
 @dataclass
 class Worker:
     """A worker with a model loaded on a specific GPU."""
     gpu_id: int
-    device: torch.device
+    device: jax.Device
     engine: Engine
     tokenizer: object
-    autocast_ctx: torch.amp.autocast
 
 class WorkerPool:
     """Pool of workers, each with a model replica on a different GPU."""
 
     def __init__(self, num_gpus: Optional[int] = None):
         if num_gpus is None:
-            if device_type == "cuda":
-                num_gpus = torch.cuda.device_count()
-            else:
-                num_gpus = 1 # e.g. cpu|mps
+            num_gpus = len(jax.devices())
         self.num_gpus = num_gpus
         self.workers: List[Worker] = []
         self.available_workers: asyncio.Queue = asyncio.Queue()
@@ -111,28 +100,21 @@ class WorkerPool:
     async def initialize(self, source: str, model_tag: Optional[str] = None, step: Optional[int] = None):
         """Load model on each GPU."""
         print(f"Initializing worker pool with {self.num_gpus} GPUs...")
-        if self.num_gpus > 1:
-            assert device_type == "cuda", "Only CUDA supports multiple workers/GPUs. cpu|mps does not."
+        devices = jax.devices()
 
-        for gpu_id in range(self.num_gpus):
+        for i in range(self.num_gpus):
+            device = devices[i]
+            print(f"Loading model on {device}...")
 
-            if device_type == "cuda":
-                device = torch.device(f"cuda:{gpu_id}")
-                print(f"Loading model on GPU {gpu_id}...")
-            else:
-                device = torch.device(device_type) # e.g. cpu|mps
-                print(f"Loading model on {device_type}...")
-
-            model, tokenizer, _ = load_model(source, device, phase="eval", model_tag=model_tag, step=step)
+            model, tokenizer, _ = load_model(source, phase="eval", model_tag=model_tag, step=step)
+            model = jax.device_put(model, device)
             engine = Engine(model, tokenizer)
-            autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
 
             worker = Worker(
-                gpu_id=gpu_id,
+                gpu_id=i,
                 device=device,
                 engine=engine,
                 tokenizer=tokenizer,
-                autocast_ctx=autocast_ctx
             )
             self.workers.append(worker)
             await self.available_workers.put(worker)
@@ -279,34 +261,33 @@ async def generate_stream(
     # Track the last complete UTF-8 string (without replacement characters)
     last_clean_text = ""
 
-    with worker.autocast_ctx:
-        for token_column, token_masks in worker.engine.generate(
-            tokens,
-            num_samples=1,
-            max_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            seed=random.randint(0, 2**31 - 1)
-        ):
-            token = token_column[0]
+    for token_column, token_masks in worker.engine.generate(
+        tokens,
+        num_samples=1,
+        max_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        seed=random.randint(0, 2**31 - 1)
+    ):
+        token = token_column[0]
 
-            # Stopping criteria
-            if token == assistant_end or token == bos:
-                break
+        # Stopping criteria
+        if token == assistant_end or token == bos:
+            break
 
-            # Append the token to sequence
-            accumulated_tokens.append(token)
-            # Decode all accumulated tokens to get proper UTF-8 handling
-            # Note that decode is a quite efficient operation, basically table lookup and string concat
-            current_text = worker.tokenizer.decode(accumulated_tokens)
-            # Only emit text if it doesn't end with a replacement character
-            # This ensures we don't emit incomplete UTF-8 sequences
-            if not current_text.endswith('�'):
-                # Extract only the new text since last clean decode
-                new_text = current_text[len(last_clean_text):]
-                if new_text:  # Only yield if there's new content
-                    yield f"data: {json.dumps({'token': new_text, 'gpu': worker.gpu_id}, ensure_ascii=False)}\n\n"
-                    last_clean_text = current_text
+        # Append the token to sequence
+        accumulated_tokens.append(token)
+        # Decode all accumulated tokens to get proper UTF-8 handling
+        # Note that decode is a quite efficient operation, basically table lookup and string concat
+        current_text = worker.tokenizer.decode(accumulated_tokens)
+        # Only emit text if it doesn't end with a replacement character
+        # This ensures we don't emit incomplete UTF-8 sequences
+        if not current_text.endswith('�'):
+            # Extract only the new text since last clean decode
+            new_text = current_text[len(last_clean_text):]
+            if new_text:  # Only yield if there's new content
+                yield f"data: {json.dumps({'token': new_text, 'gpu': worker.gpu_id}, ensure_ascii=False)}\n\n"
+                last_clean_text = current_text
 
     yield f"data: {json.dumps({'done': True})}\n\n"
 
