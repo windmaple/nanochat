@@ -16,7 +16,7 @@ import numpy as np
 import traceback
 import sys
 
-from nanochat.common import print0, DummyWandb, get_base_dir, setup_default_logging, print_banner
+from nanochat.common import print0, DummyWandb, get_base_dir, setup_default_logging
 from nanochat.checkpoint_manager import load_model, CheckpointManager
 from nanochat.engine import Engine
 from nanochat.muon import get_muon
@@ -58,7 +58,6 @@ user_config = {k: globals()[k] for k in config_keys} # possibly useful for loggi
 # -----------------------------------------------------------------------------
 
 def main():
-    print_banner()
     setup_default_logging()
 
     # Init JAX Distributed
@@ -129,12 +128,8 @@ def main():
                     batch = []
 
     examples_per_step = device_batch_size * device_count
-    print0(f"Target examples per step: {target_examples_per_step}")
-    print0(f"Device batch size: {device_batch_size}")
-    print0(f"Examples per step is device_batch_size * device_count: {examples_per_step}")
     assert target_examples_per_step % examples_per_step == 0, "Target examples per step must be divisible by examples per step"
     grad_accum_steps = target_examples_per_step // examples_per_step
-    print0(f"=> Setting grad accum steps: {grad_accum_steps}")
 
     # Use a local num_iterations to avoid modifying the global one
     local_num_iterations = num_iterations
@@ -224,7 +219,6 @@ def main():
                 loss = eval_step(model, val_inputs, val_targets)
                 losses.append(float(loss))
             val_loss = sum(losses) / len(losses)
-            print0(f"Step {training_step:05d} | Validation loss: {val_loss:.6f}")
             wandb_run.log({
                 "step": training_step,
                 "val_loss": val_loss,
@@ -246,7 +240,6 @@ def main():
         avg_loss = total_loss / grad_accum_steps
         
         # logging
-        print0(f"Step {training_step:05d}/{local_num_iterations:05d} | Training loss: {avg_loss:.6f}")
         wandb_run.log({
             "step": training_step,
             "train_loss": avg_loss,

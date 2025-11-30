@@ -18,7 +18,7 @@ else
 fi
 
 echo "--- Verifying SFT (chat_sft.py) ---"
-if python -m scripts.chat_sft --num_iterations=1 --device_batch_size=1 --target_examples_per_step=1; then
+if python -m scripts.chat_sft --num_iterations=1 --device_batch_size=1 --target_examples_per_step=1 > /dev/null 2>&1; then
   echo "SFT successful"
 else
   echo "SFT failed"
